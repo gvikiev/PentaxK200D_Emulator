@@ -5,11 +5,25 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
 
 static const char *TAG = "USB_DEVICE";
+
+/* Monotonic sequence for vendor SCSI requests. */
+static uint32_t s_scsi_sequence = 0;
+
+static uint32_t next_scsi_sequence(void)
+{
+    return ++s_scsi_sequence;
+}
+
+static uint64_t log_timestamp_ms(void)
+{
+    return (uint64_t)esp_timer_get_time() / 1000ULL;
+}
 
 /* =========================================================
  * Pentax vendor-specific SCSI commands
@@ -140,8 +154,8 @@ static uint32_t s_download_length = 0;
 /*
  * 2x2 JPEG.
  *
- * This is deliberately kept small because the current
- * TinyUSB MSC buffer is 512 bytes.
+ * This test file is deliberately small. Its size is independent
+ * of the TinyUSB MSC transport buffer and PENTAX_MAX_RESULT.
  *
  * IMPORTANT:
  *
@@ -367,6 +381,106 @@ static void write_be32(uint8_t *data, uint32_t value)
     data[1] = (uint8_t)(value >> 16);
     data[2] = (uint8_t)(value >> 8);
     data[3] = (uint8_t)value;
+}
+
+/* =========================================================
+ * Protocol logging helpers
+ * ========================================================= */
+
+static const char *pentax_transfer_name(uint8_t type)
+{
+    switch (type) {
+    case PENTAX_T_SEND_COMMAND: return "SEND_COMMAND";
+    case PENTAX_T_GET_STATUS:   return "GET_STATUS";
+    case PENTAX_T_SEND_ARGS:    return "SEND_ARGS";
+    case PENTAX_T_READ_RESULT:  return "READ_RESULT";
+    default:                    return "UNKNOWN";
+    }
+}
+
+static const char *pentax_command_name(uint8_t group, uint8_t command)
+{
+    switch (group) {
+    case PENTAX_G_SYS:
+        switch (command) {
+        case PENTAX_C_CONNECT_MODE: return "CONNECT_MODE";
+        case PENTAX_C_GET_STATUS:   return "GET_CAMERA_STATUS";
+        default:                    return "UNKNOWN_SYS_COMMAND";
+        }
+
+    case PENTAX_G_BUFFER:
+        switch (command) {
+        case PENTAX_C_BUFFER_STATUS: return "BUFFER_STATUS";
+        case PENTAX_C_BUFFER_SELECT: return "BUFFER_SELECT";
+        case PENTAX_C_BUFFER_DELETE: return "BUFFER_DELETE";
+        default:                     return "UNKNOWN_BUFFER_COMMAND";
+        }
+
+    case PENTAX_G_SEGMENT:
+        switch (command) {
+        case PENTAX_C_SEGMENT_INFO: return "SEGMENT_INFO";
+        case PENTAX_C_SEGMENT_NEXT: return "SEGMENT_NEXT";
+        default:                    return "UNKNOWN_SEGMENT_COMMAND";
+        }
+
+    case PENTAX_G_ACTION:
+        switch (command) {
+        case PENTAX_C_SHUTTER: return "SHUTTER";
+        default:               return "UNKNOWN_ACTION_COMMAND";
+        }
+
+    case PENTAX_G_DOWNLOAD:
+        switch (command) {
+        case PENTAX_C_DOWNLOAD_PREPARE: return "DOWNLOAD_PREPARE";
+        default:                       return "UNKNOWN_DOWNLOAD_COMMAND";
+        }
+
+    default:
+        return "UNKNOWN_GROUP";
+    }
+}
+
+/*
+ * Log at most 16 bytes. This keeps logs readable and avoids
+ * dumping entire image chunks to the serial console.
+ */
+static void log_data_preview(const char *label,
+                             const uint8_t *data,
+                             uint32_t len)
+{
+    uint32_t preview_len = (len > 16u) ? 16u : len;
+
+    ESP_LOGI(TAG, "%s: %lu bytes (preview %lu bytes)",
+             label,
+             (unsigned long)len,
+             (unsigned long)preview_len);
+
+    if (preview_len > 0u && data != NULL) {
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, data, preview_len, ESP_LOG_INFO);
+    }
+}
+
+
+/* Snapshot the protocol state around meaningful SCSI operations. */
+static void log_camera_state(const char *stage, uint32_t seq)
+{
+    ESP_LOGI(TAG,
+             "[%lu] STATE %s: connected=%u mask=0x%08lX "
+             "selected=%u segment=%lu download_prepared=%u "
+             "download_addr=0x%08lX download_remaining=%lu "
+             "args_len=%lu result_len=%lu status=0x%02X",
+             (unsigned long)seq,
+             stage,
+             (unsigned)s_connected,
+             (unsigned long)s_buffer_mask,
+             (unsigned)s_buffer_selected,
+             (unsigned long)s_segment_index,
+             (unsigned)s_download_prepared,
+             (unsigned long)s_download_addr,
+             (unsigned long)s_download_length,
+             (unsigned long)s_args_len,
+             (unsigned long)s_result_len,
+             s_command_status);
 }
 
 
@@ -992,369 +1106,313 @@ int32_t pentax_msc_scsi_cb(uint8_t lun,
                            void *buffer,
                            uint16_t bufsize)
 {
-    if (scsi_cmd[0] != PENTAX_SCSI_OPCODE) {
+    uint32_t seq = next_scsi_sequence();
+    uint64_t timestamp = log_timestamp_ms();
 
-        ESP_LOGW(TAG,
-                 "Unsupported SCSI opcode: 0x%02X",
-                 scsi_cmd[0]);
-
-        tud_msc_set_sense(lun, 0x05, 0x20, 0x00);
-
+    if (scsi_cmd == NULL) {
+        ESP_LOGE(TAG, "[%lu] SCSI callback received NULL CDB",
+                 (unsigned long)seq);
         return -1;
     }
 
+    if (scsi_cmd[0] != PENTAX_SCSI_OPCODE) {
+        ESP_LOGW(TAG,
+                 "[%lu][%llu ms] Unexpected opcode in Pentax callback: 0x%02X",
+                 (unsigned long)seq,
+                 (unsigned long long)timestamp,
+                 scsi_cmd[0]);
+        tud_msc_set_sense(lun, 0x05, 0x20, 0x00);
+        return -1;
+    }
 
     uint8_t type = scsi_cmd[1];
 
+    /* GET_STATUS is polled frequently: keep its trace at DEBUG. */
+    if (type == PENTAX_T_GET_STATUS) {
+        ESP_LOGD(TAG,
+                 "[%lu][%llu ms] SCSI RX: lun=%u CDB=%02X %02X %02X %02X "
+                 "%02X %02X %02X %02X bufsize=%u",
+                 (unsigned long)seq,
+                 (unsigned long long)timestamp,
+                 lun,
+                 scsi_cmd[0], scsi_cmd[1], scsi_cmd[2], scsi_cmd[3],
+                 scsi_cmd[4], scsi_cmd[5], scsi_cmd[6], scsi_cmd[7],
+                 bufsize);
+    } else {
+        ESP_LOGI(TAG,
+                 "[%lu][%llu ms] SCSI RX: lun=%u opcode=0x%02X "
+                 "type=0x%02X (%s) CDB=%02X %02X %02X %02X "
+                 "%02X %02X %02X %02X bufsize=%u buffer=%p",
+                 (unsigned long)seq,
+                 (unsigned long long)timestamp,
+                 lun,
+                 scsi_cmd[0], type, pentax_transfer_name(type),
+                 scsi_cmd[0], scsi_cmd[1], scsi_cmd[2], scsi_cmd[3],
+                 scsi_cmd[4], scsi_cmd[5], scsi_cmd[6], scsi_cmd[7],
+                 bufsize, buffer);
+        log_camera_state("BEFORE SCSI", seq);
+    }
 
     /* =====================================================
-     * SEND ARGUMENTS
-     *
-     * F0 4F
-     *
-     * Host -> Device
+     * SEND ARGUMENTS: Host -> Device
      * ===================================================== */
-
     if (type == PENTAX_T_SEND_ARGS) {
-
         uint16_t requested_len = read_le16(&scsi_cmd[4]);
-        uint16_t offset        = read_le16(&scsi_cmd[2]);
-
+        uint16_t offset = read_le16(&scsi_cmd[2]);
 
         if (offset != 0 ||
             requested_len != bufsize ||
             requested_len > PENTAX_MAX_ARGS ||
             (requested_len > 0 && buffer == NULL)) {
-
             ESP_LOGE(TAG,
-                     "Invalid argument transfer: "
-                     "offset=%u len=%u received=%u",
-                     offset,
-                     requested_len,
-                     bufsize);
-
+                     "[%lu] Invalid argument transfer: offset=%u "
+                     "cdb_len=%u actual_len=%u buffer=%p max=%u",
+                     (unsigned long)seq, offset, requested_len,
+                     bufsize, buffer, PENTAX_MAX_ARGS);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
-
 
         if (requested_len > 0) {
             memcpy(s_args, buffer, requested_len);
         }
-
-
         s_args_len = requested_len;
 
-
         ESP_LOGI(TAG,
-                 "Received Pentax arguments: %u bytes",
-                 requested_len);
-
-
+                 "[%lu] ARGUMENTS RX: offset=%u length=%u",
+                 (unsigned long)seq, offset, requested_len);
+        log_data_preview("Arguments RX", s_args, s_args_len);
+        log_camera_state("AFTER ARGUMENTS", seq);
         return 0;
     }
 
-
     /* =====================================================
-     * SEND COMMAND
-     *
-     * F0 24
-     *
-     * No data transfer.
+     * SEND COMMAND: no data transfer
      * ===================================================== */
-
     if (type == PENTAX_T_SEND_COMMAND) {
-
         if (bufsize != 0) {
-
+            ESP_LOGE(TAG,
+                     "[%lu] SEND_COMMAND has unexpected data length=%u",
+                     (unsigned long)seq, bufsize);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
-
 
         uint8_t group = scsi_cmd[2];
         uint8_t command = scsi_cmd[3];
+        uint16_t expected_args_len = read_le16(&scsi_cmd[4]);
 
-        uint16_t expected_args_len =
-            read_le16(&scsi_cmd[4]);
-
+        ESP_LOGI(TAG,
+                 "[%lu] COMMAND EXEC: %s group=0x%02X command=0x%02X "
+                 "expected_args=%u actual_args=%lu",
+                 (unsigned long)seq,
+                 pentax_command_name(group, command),
+                 group, command, expected_args_len,
+                 (unsigned long)s_args_len);
 
         if (expected_args_len != s_args_len) {
-
             ESP_LOGE(TAG,
-                     "Argument length mismatch: "
-                     "expected=%u actual=%lu",
-                     expected_args_len,
+                     "[%lu] Argument length mismatch: expected=%u actual=%lu",
+                     (unsigned long)seq, expected_args_len,
                      (unsigned long)s_args_len);
-
-
             set_command_status(PENTAX_ST_ILLEGAL_PARAM);
-
             clear_result();
-
-
             memset(s_args, 0, sizeof(s_args));
             s_args_len = 0;
 
-
+            ESP_LOGE(TAG, "[%lu] COMMAND REJECTED: argument length mismatch",
+                     (unsigned long)seq);
+            log_camera_state("AFTER COMMAND REJECT", seq);
             return 0;
         }
 
-
         process_pentax_command(group, command);
 
+        ESP_LOGI(TAG,
+                 "[%lu][%llu ms] COMMAND RESP: %s status=0x%02X "
+                 "result_len=%lu",
+                 (unsigned long)seq,
+                 (unsigned long long)log_timestamp_ms(),
+                 pentax_command_name(group, command),
+                 s_command_status,
+                 (unsigned long)s_result_len);
+        log_camera_state("AFTER COMMAND", seq);
+
+        /* DOWNLOAD_PREPARE describes file bytes; s_result is only 512 bytes. */
+        if (!s_download_prepared && s_result_len <= sizeof(s_result)) {
+            log_data_preview("Command result", s_result, s_result_len);
+        }
         return 0;
     }
 
-
     /* =====================================================
-     * GET STATUS
-     *
-     * F0 26
-     *
-     * Device -> Host
-     *
-     * [0..3] result length LE32
-     * [4..5] reserved
-     * [6]    ready
-     * [7]    status
+     * GET STATUS: Device -> Host
      * ===================================================== */
-
     if (type == PENTAX_T_GET_STATUS) {
-
         if (bufsize < 8 || buffer == NULL) {
-
+            ESP_LOGE(TAG,
+                     "[%lu] GET_STATUS invalid buffer: bufsize=%u buffer=%p",
+                     (unsigned long)seq, bufsize, buffer);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
 
-
         uint8_t *out = (uint8_t *)buffer;
-
-
         out[0] = (uint8_t)s_result_len;
         out[1] = (uint8_t)(s_result_len >> 8);
         out[2] = (uint8_t)(s_result_len >> 16);
         out[3] = (uint8_t)(s_result_len >> 24);
-
-
         out[4] = 0;
         out[5] = 0;
-
         out[6] = PENTAX_ST_READY;
         out[7] = s_command_status;
 
-
+        ESP_LOGD(TAG,
+                 "[%lu] STATUS TX: result_len=%lu ready=0x%02X status=0x%02X",
+                 (unsigned long)seq,
+                 (unsigned long)s_result_len, out[6], out[7]);
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, out, 8, ESP_LOG_DEBUG);
         return 8;
     }
 
-
     /* =====================================================
-     * READ RESULT
-     *
-     * F0 49
-     *
-     * Device -> Host
-     *
-     * For ordinary commands:
-     *     return s_result
-     *
-     * For DOWNLOAD:
-     *     return a slice of the virtual file.
+     * READ RESULT: ordinary command response or file bytes
      * ===================================================== */
-
     if (type == PENTAX_T_READ_RESULT) {
-
         uint16_t requested_len = read_le16(&scsi_cmd[4]);
 
+        ESP_LOGI(TAG,
+                 "[%lu] READ_RESULT RX: requested=%u bufsize=%u "
+                 "prepared=%u addr=0x%08lX remaining=%lu",
+                 (unsigned long)seq,
+                 requested_len, bufsize,
+                 (unsigned)s_download_prepared,
+                 (unsigned long)s_download_addr,
+                 (unsigned long)s_download_length);
 
-        /*
-         * -------------------------------------------------
-         * Ordinary command result
-         * -------------------------------------------------
-         */
         if (!s_download_prepared) {
-
             if (requested_len > s_result_len ||
                 requested_len > bufsize ||
                 (requested_len > 0 && buffer == NULL)) {
-
                 ESP_LOGE(TAG,
-                         "Invalid result read: "
-                         "requested=%u available=%lu buffer=%u",
-                         requested_len,
-                         (unsigned long)s_result_len,
-                         bufsize);
-
+                         "[%lu] Invalid ordinary result read: requested=%u "
+                         "available=%lu bufsize=%u buffer=%p",
+                         (unsigned long)seq, requested_len,
+                         (unsigned long)s_result_len, bufsize, buffer);
                 tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
                 return -1;
             }
-
 
             if (requested_len > 0) {
                 memcpy(buffer, s_result, requested_len);
             }
 
-
             ESP_LOGI(TAG,
-                     "Result sent to Host: %u bytes",
-                     requested_len);
-
-
+                     "[%lu] READ_RESULT ordinary TX: %u bytes",
+                     (unsigned long)seq, requested_len);
+            log_data_preview("Result TX", (const uint8_t *)buffer,
+                             requested_len);
+            log_camera_state("AFTER ORDINARY READ", seq);
             return requested_len;
         }
 
-
-        /*
-         * -------------------------------------------------
-         * File download result
-         * -------------------------------------------------
-         */
-
         if (buffer == NULL && requested_len > 0) {
-
+            ESP_LOGE(TAG, "[%lu] File READ_RESULT has NULL buffer", (unsigned long)seq);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
-
 
         if (requested_len > bufsize) {
-
             ESP_LOGE(TAG,
-                     "Download result too large for USB buffer: "
-                     "requested=%u bufsize=%u",
-                     requested_len,
-                     bufsize);
-
+                     "[%lu] Download result too large: requested=%u bufsize=%u",
+                     (unsigned long)seq, requested_len, bufsize);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
 
-
-        if (!s_buffer_selected ||
-            (s_buffer_mask & 0x00000001u) == 0) {
-
+        if (!s_buffer_selected || (s_buffer_mask & 0x00000001u) == 0) {
             ESP_LOGE(TAG,
-                     "Download requested without valid buffer");
-
+                     "[%lu] Download without valid buffer: selected=%u mask=0x%08lX",
+                     (unsigned long)seq,
+                     (unsigned)s_buffer_selected,
+                     (unsigned long)s_buffer_mask);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
 
-
-        /*
-         * Address comes from the current prepared operation.
-         */
         if (s_download_addr < PENTAX_JPEG_ADDR) {
-
+            ESP_LOGE(TAG,
+                     "[%lu] Download address below base: addr=0x%08lX base=0x%08lX",
+                     (unsigned long)seq,
+                     (unsigned long)s_download_addr,
+                     (unsigned long)PENTAX_JPEG_ADDR);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
 
-
-        uint32_t offset =
-            s_download_addr - PENTAX_JPEG_ADDR;
-
-
+        uint32_t offset = s_download_addr - PENTAX_JPEG_ADDR;
         if (offset > s_file_size) {
-
             ESP_LOGE(TAG,
-                     "Download offset outside file: %lu",
-                     (unsigned long)offset);
-
+                     "[%lu] Download offset outside file: offset=%lu file_size=%lu",
+                     (unsigned long)seq,
+                     (unsigned long)offset,
+                     (unsigned long)s_file_size);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
 
-
-        uint32_t available =
-            s_file_size - offset;
-
-
-        /*
-         * The requested read must not exceed the prepared
-         * operation or the actual file.
-         */
-        if (requested_len > available ||
-            requested_len > s_download_length) {
-
+        uint32_t available = s_file_size - offset;
+        if (requested_len > available || requested_len > s_download_length) {
             ESP_LOGE(TAG,
-                     "Invalid download read: "
-                     "requested=%u available=%lu prepared=%lu",
-                     requested_len,
+                     "[%lu] INVALID DOWNLOAD READ: requested=%u bufsize=%u "
+                     "available=%lu prepared_remaining=%lu offset=%lu "
+                     "file_size=%lu addr=0x%08lX selected=%u mask=0x%08lX",
+                     (unsigned long)seq,
+                     requested_len, bufsize,
                      (unsigned long)available,
-                     (unsigned long)s_download_length);
-
+                     (unsigned long)s_download_length,
+                     (unsigned long)offset,
+                     (unsigned long)s_file_size,
+                     (unsigned long)s_download_addr,
+                     (unsigned)s_buffer_selected,
+                     (unsigned long)s_buffer_mask);
             tud_msc_set_sense(lun, 0x05, 0x24, 0x00);
-
             return -1;
         }
-
 
         if (requested_len > 0) {
-
-            memcpy(buffer,
-                   s_file_data + offset,
-                   requested_len);
+            memcpy(buffer, s_file_data + offset, requested_len);
         }
-
 
         ESP_LOGI(TAG,
-                 "File data sent: "
-                 "addr=0x%08lX offset=%lu len=%u",
+                 "[%lu] FILE DATA TX: addr=0x%08lX offset=%lu len=%u "
+                 "remaining_before=%lu file_size=%lu",
+                 (unsigned long)seq,
                  (unsigned long)s_download_addr,
                  (unsigned long)offset,
-                 requested_len);
+                 requested_len,
+                 (unsigned long)s_download_length,
+                 (unsigned long)s_file_size);
+        log_data_preview("JPEG DATA TX", (const uint8_t *)buffer,
+                         requested_len);
 
-
-        /*
-         * Advance virtual file address.
-         *
-         * This means consecutive DOWNLOAD PREPARE operations
-         * can read the file sequentially.
-         */
+        /* Advance virtual file position after the requested bytes. */
         s_download_addr += requested_len;
-
-
-        if (s_download_length >= requested_len) {
-            s_download_length -= requested_len;
-        } else {
-            s_download_length = 0;
-        }
-
-
+        s_download_length -= requested_len;
         if (s_download_length == 0) {
             s_download_prepared = false;
         }
 
-
+        log_camera_state("AFTER FILE READ", seq);
         return requested_len;
     }
 
-
-    /* =====================================================
-     * Unknown Pentax transfer type
-     * ===================================================== */
-
     ESP_LOGW(TAG,
-             "Unknown Pentax command type: 0x%02X",
-             type);
-
-
+             "[%lu] Unknown Pentax transfer type: 0x%02X",
+             (unsigned long)seq, type);
     tud_msc_set_sense(lun, 0x05, 0x20, 0x00);
-
     return -1;
 }
-
 
 /* =========================================================
  * USB Device Event Handler
@@ -1371,27 +1429,25 @@ static void usb_device_event_handler(tinyusb_event_t *event,
     case TINYUSB_EVENT_ATTACHED:
 
         ESP_LOGI(TAG,
-                 "USB Host connected");
-
+                 "[%llu ms] USB HOST ATTACHED",
+                 (unsigned long long)log_timestamp_ms());
+        log_camera_state("USB ATTACHED", 0);
         break;
 
 
     case TINYUSB_EVENT_DETACHED:
 
         ESP_LOGW(TAG,
-                 "USB Host disconnected");
+                 "[%llu ms] USB HOST DETACHED",
+                 (unsigned long long)log_timestamp_ms());
+        log_camera_state("BEFORE DETACH RESET", 0);
 
-        /*
-         * USB session is gone.
-         *
-         * Keep the captured image itself, just reset
-         * connection-related state.
-         */
+        /* Keep the captured image, reset connection-related state. */
         s_connected = false;
         s_buffer_selected = false;
-
         reset_download_state();
 
+        log_camera_state("AFTER DETACH RESET", 0);
         break;
 
 
@@ -1413,7 +1469,8 @@ static void usb_device_event_handler(tinyusb_event_t *event,
 esp_err_t usb_device_init(void)
 {
     ESP_LOGI(TAG,
-             "Initializing Pentax USB Device...");
+             "[%llu ms] Initializing Pentax USB Device...",
+             (unsigned long long)log_timestamp_ms());
 
 
     reset_camera_state();
@@ -1469,7 +1526,8 @@ esp_err_t usb_device_init(void)
 
 
     ESP_LOGI(TAG,
-             "Virtual file size: %lu bytes",
+             "Virtual file: addr=0x%08lX size=%lu bytes",
+             (unsigned long)PENTAX_JPEG_ADDR,
              (unsigned long)s_file_size);
 
 
