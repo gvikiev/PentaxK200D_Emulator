@@ -1,6 +1,7 @@
 #include "pentax_cam_model.h"
 
 #include <string.h>
+#include <stdio.h>
 
 /* =========================================================
  * Pentax command groups / commands (see the sibling PentaxK200D
@@ -87,10 +88,11 @@ static void wr32(uint8_t *p, uint32_t v)
  * Init / small helpers
  * ========================================================= */
 
-void pentax_cam_model_init(pentax_cam_model_t *m, const uint8_t *file_data, uint32_t file_size)
+void pentax_cam_model_init(pentax_cam_model_t *m, const uint8_t *template_data, uint32_t template_size)
 {
     memset(m, 0, sizeof(*m));
     m->selected_slot = -1;
+    m->download_slot = -1;
     m->command_status = PENTAX_CAM_ST_OK;
 
     /* Plausible defaults, loosely an 18-55/F3.5-5.6 kit lens on a K200D. */
@@ -118,8 +120,8 @@ void pentax_cam_model_init(pentax_cam_model_t *m, const uint8_t *file_data, uint
     m->focal_length_nom = 35; m->focal_length_denom = 1; /* 35mm, mid-zoom */
     m->focus_distance = 2000;
 
-    m->file_data = file_data;
-    m->file_size = file_size;
+    m->template_data = template_data;
+    m->template_size = template_size;
     m->file_addr_base = 0x10000000u;
 }
 
@@ -133,6 +135,7 @@ static void reset_download_state(pentax_cam_model_t *m)
     m->segment_index = 0;
     m->download_addr = 0;
     m->download_length = 0;
+    m->download_slot = -1;
     m->download_prepared = false;
 }
 
@@ -329,7 +332,7 @@ static void process_segment_command(pentax_cam_model_t *m, uint8_t command)
         if (m->segment_index == 0) {
             wr32(&m->result[4], SEG_DATA);
             wr32(&m->result[8], m->file_addr_base);
-            wr32(&m->result[12], m->file_size);
+            wr32(&m->result[12], m->slot_file_size[m->selected_slot]);
             m->result_len = 16;
             return;
         }
@@ -382,23 +385,25 @@ static void process_download_command(pentax_cam_model_t *m, uint8_t command)
         }
         uint32_t addr = rd32(&m->args[0]);
         uint32_t len = rd32(&m->args[4]);
+        uint32_t slot_size = m->slot_file_size[m->selected_slot];
 
         if (addr < m->file_addr_base) {
             m->command_status = PENTAX_CAM_ST_ILLEGAL_PARAM;
             return;
         }
         uint32_t offset = addr - m->file_addr_base;
-        if (offset > m->file_size) {
+        if (offset > slot_size) {
             m->command_status = PENTAX_CAM_ST_ILLEGAL_PARAM;
             return;
         }
-        uint32_t remaining = m->file_size - offset;
+        uint32_t remaining = slot_size - offset;
         if (len > remaining) {
             len = remaining;
         }
 
         m->download_addr = addr;
         m->download_length = len;
+        m->download_slot = m->selected_slot;
         m->download_prepared = true;
         m->result_len = len; /* bytes themselves come via READ_RESULT */
         return;
@@ -411,11 +416,55 @@ static void process_download_command(pentax_cam_model_t *m, uint8_t command)
  * Command: ACTION
  * ========================================================= */
 
+/* Renders a fresh copy of the template JPEG into slot_files[slot], with a
+ * small COM (comment, marker 0xFFFE) segment inserted right after SOI that
+ * identifies the slot and a monotonically increasing capture sequence
+ * number. A COM segment is invisible to any JPEG decoder that doesn't care
+ * about it (the real K200D's own files surely carry plenty of APPn/COM
+ * segments of their own), so this stays a structurally valid JPEG while
+ * making every capture's bytes genuinely distinguishable from every other
+ * slot's -- and from an earlier capture into the same slot. */
+static void render_photo_into_slot(pentax_cam_model_t *m, uint32_t slot)
+{
+    uint32_t seq = ++m->next_capture_seq;
+    uint8_t *dst = m->slot_files[slot];
+    uint32_t pos = 0;
+
+    dst[pos++] = 0xFF; dst[pos++] = 0xD8; /* SOI */
+
+    char payload[32];
+    int n = snprintf(payload, sizeof(payload), "PENTAXEMU SLOT=%01u SEQ=%08lu",
+                      (unsigned)slot, (unsigned long)seq);
+    if (n < 0) {
+        n = 0;
+    } else if ((size_t)n >= sizeof(payload)) {
+        n = (int)sizeof(payload) - 1;
+    }
+    uint16_t seg_len = (uint16_t)(n + 2); /* JPEG segment length includes itself */
+    dst[pos++] = 0xFF; dst[pos++] = 0xFE;
+    dst[pos++] = (uint8_t)(seg_len >> 8);
+    dst[pos++] = (uint8_t)seg_len;
+    memcpy(dst + pos, payload, (size_t)n);
+    pos += (uint32_t)n;
+
+    /* Append the template's own body, skipping its SOI (already written
+     * above). */
+    uint32_t rest = m->template_size - 2;
+    if (pos + rest > PENTAX_CAM_MAX_PHOTO_SIZE) {
+        rest = PENTAX_CAM_MAX_PHOTO_SIZE - pos; /* defensive; shouldn't trigger */
+    }
+    memcpy(dst + pos, m->template_data + 2, rest);
+    pos += rest;
+
+    m->slot_file_size[slot] = pos;
+}
+
 static void capture_new_photo(pentax_cam_model_t *m)
 {
     for (uint32_t i = 0; i < PENTAX_CAM_RAM_SLOTS; i++) {
         if ((m->buffer_mask & (1u << i)) == 0) {
             m->buffer_mask |= (1u << i);
+            render_photo_into_slot(m, i);
             break;
         }
     }
@@ -711,8 +760,9 @@ uint16_t pentax_cam_model_read_result(pentax_cam_model_t *m, uint16_t want, uint
         return n;
     }
 
+    uint32_t slot_size = m->slot_file_size[m->download_slot];
     uint32_t offset = m->download_addr - m->file_addr_base;
-    uint32_t available = (offset <= m->file_size) ? (m->file_size - offset) : 0;
+    uint32_t available = (offset <= slot_size) ? (slot_size - offset) : 0;
     uint32_t n = want;
     if (n > available) {
         n = available;
@@ -720,8 +770,8 @@ uint16_t pentax_cam_model_read_result(pentax_cam_model_t *m, uint16_t want, uint
     if (n > m->download_length) {
         n = m->download_length;
     }
-    if (n > 0 && m->file_data != NULL) {
-        memcpy(out, m->file_data + offset, n);
+    if (n > 0) {
+        memcpy(out, m->slot_files[m->download_slot] + offset, n);
     }
 
     m->download_addr += n;

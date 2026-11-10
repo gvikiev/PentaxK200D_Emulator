@@ -24,6 +24,12 @@ extern "C" {
 #define PENTAX_CAM_MAX_ARGS    32u
 #define PENTAX_CAM_MAX_RESULT  512u
 
+/* Must comfortably fit the template JPEG passed to pentax_cam_model_init()
+ * plus the small COM marker segment capture_new_photo() inserts into every
+ * rendered copy (see pentax_cam_model.c) -- a few hundred bytes of
+ * overhead at most. */
+#define PENTAX_CAM_MAX_PHOTO_SIZE 2048u
+
 /* Pentax status byte values (S1), echoed via the 8-byte GET_STATUS reply
  * and used to pick the READY bit too. */
 #define PENTAX_CAM_ST_READY         0x01u
@@ -43,8 +49,10 @@ typedef struct {
     bool     download_prepared;
     uint32_t download_addr;
     uint32_t download_length;
+    int32_t  download_slot;      /* which slot_files[] the in-progress download reads from */
 
     bool     bulb_active;
+    uint32_t next_capture_seq;   /* monotonic; embedded in each capture's COM marker */
 
     /* Exposure / image-quality / AF state -- mirrors the real k200d_status_t
      * layout field-for-field so build_full_status() can place each one at
@@ -76,15 +84,23 @@ typedef struct {
     uint8_t  args[PENTAX_CAM_MAX_ARGS];
     uint32_t args_len;
 
-    /* The one virtual photo every RAM slot serves -- content is identical
-     * regardless of slot/buffer-type, which is enough for protocol-level
-     * testing (see README: per-slot distinct imagery is out of scope). */
-    const uint8_t *file_data;
-    uint32_t file_size;
+    /* The template JPEG every capture is rendered from (see
+     * capture_new_photo() in pentax_cam_model.c): each RAM slot gets its
+     * own copy with a small COM marker segment identifying the slot and
+     * capture sequence number, so different slots -- and successive
+     * captures into the same slot -- actually differ byte-for-byte instead
+     * of every photo being identical. */
+    const uint8_t *template_data;
+    uint32_t template_size;
     uint32_t file_addr_base;
+
+    uint8_t  slot_files[PENTAX_CAM_RAM_SLOTS][PENTAX_CAM_MAX_PHOTO_SIZE];
+    uint32_t slot_file_size[PENTAX_CAM_RAM_SLOTS];
 } pentax_cam_model_t;
 
-void pentax_cam_model_init(pentax_cam_model_t *m, const uint8_t *file_data, uint32_t file_size);
+/* `template_data`/`template_size` must stay valid for the model's whole
+ * lifetime (only the pointer is kept, not a copy). */
+void pentax_cam_model_init(pentax_cam_model_t *m, const uint8_t *template_data, uint32_t template_size);
 
 /* SEND_ARGS (F0 4F). Returns false if `len` exceeds PENTAX_CAM_MAX_ARGS --
  * that's a transport-level problem (oversized transfer), not something a

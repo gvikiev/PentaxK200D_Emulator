@@ -57,6 +57,33 @@ static void do_cmd3(pentax_cam_model_t *m, uint8_t group, uint8_t command, uint3
     do_cmd(m, group, command, args, sizeof(args));
 }
 
+/* Every rendered photo is: SOI, then a COM (0xFFFE) marker segment whose
+ * own length field says how many bytes it spans, then the template's body
+ * (its own SOI already stripped). Returns the offset where that template
+ * body resumes, so tests can check the "real" content without hardcoding
+ * the marker's exact size. */
+static uint32_t rendered_photo_tail_offset(const uint8_t *photo)
+{
+    CHECK_EQ(photo[0], 0xFF); CHECK_EQ(photo[1], 0xD8);
+    CHECK_EQ(photo[2], 0xFF); CHECK_EQ(photo[3], 0xFE);
+    uint16_t seg_len = rd_be16(&photo[4]); /* includes the 2 length bytes themselves */
+    return 4u + seg_len;
+}
+
+static bool bytes_contain(const uint8_t *hay, size_t hay_len, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || nlen > hay_len) {
+        return false;
+    }
+    for (size_t i = 0; i + nlen <= hay_len; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void connect(pentax_cam_model_t *m)
 {
     do_cmd1(m, 0x00, 0x00, 1);
@@ -466,7 +493,8 @@ static void test_segment_info_and_next(void)
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_OK);
     CHECK_EQ(rd_be32(&m.result[4]), 3 /* SEG_DATA */);
     CHECK_EQ(rd_be32(&m.result[8]), m.file_addr_base);
-    CHECK_EQ(rd_be32(&m.result[12]), sizeof(k_test_file));
+    CHECK_EQ(rd_be32(&m.result[12]), m.slot_file_size[0]); /* rendered size, not the raw template's */
+    CHECK(m.slot_file_size[0] > sizeof(k_test_file)); /* the marker segment adds bytes */
 
     do_cmd1(&m, G_SEG, C_SEG_NEXT, 0);
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_OK);
@@ -488,16 +516,20 @@ static void test_download_full_file_single_chunk(void)
     do_cmd1(&m, G_ACT, C_SHUTTER, 2);
     do_cmd3(&m, G_BUF, C_BUF_SELECT, 0, 0, 0);
 
-    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, sizeof(k_test_file));
+    uint32_t rendered_size = m.slot_file_size[0];
+    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, rendered_size);
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_OK);
-    CHECK_EQ(m.result_len, sizeof(k_test_file));
+    CHECK_EQ(m.result_len, rendered_size);
     CHECK(m.download_prepared == true);
 
-    uint8_t out[64];
-    uint16_t n = pentax_cam_model_read_result(&m, sizeof(out), out);
-    CHECK_EQ(n, sizeof(k_test_file));
-    CHECK(memcmp(out, k_test_file, sizeof(k_test_file)) == 0);
+    uint8_t out[PENTAX_CAM_MAX_PHOTO_SIZE];
+    uint16_t n = pentax_cam_model_read_result(&m, (uint16_t)rendered_size, out);
+    CHECK_EQ(n, rendered_size);
     CHECK(m.download_prepared == false); /* fully drained */
+
+    uint32_t tail = rendered_photo_tail_offset(out);
+    CHECK_EQ(rendered_size - tail, sizeof(k_test_file) - 2);
+    CHECK(memcmp(out + tail, k_test_file + 2, sizeof(k_test_file) - 2) == 0);
 }
 
 static void test_download_multi_chunk_like_real_dl_chunk_looping(void)
@@ -508,10 +540,11 @@ static void test_download_multi_chunk_like_real_dl_chunk_looping(void)
     do_cmd1(&m, G_ACT, C_SHUTTER, 2);
     do_cmd3(&m, G_BUF, C_BUF_SELECT, 0, 0, 0);
 
-    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, sizeof(k_test_file));
+    uint32_t rendered_size = m.slot_file_size[0];
+    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, rendered_size);
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_OK);
 
-    uint8_t assembled[sizeof(k_test_file)];
+    uint8_t assembled[PENTAX_CAM_MAX_PHOTO_SIZE];
     size_t got = 0;
     const uint16_t chunk = 6; /* smaller than the file: forces several reads */
     while (m.download_prepared) {
@@ -522,8 +555,43 @@ static void test_download_multi_chunk_like_real_dl_chunk_looping(void)
         memcpy(assembled + got, buf, n);
         got += n;
     }
-    CHECK_EQ(got, sizeof(k_test_file));
-    CHECK(memcmp(assembled, k_test_file, sizeof(k_test_file)) == 0);
+    CHECK_EQ(got, rendered_size);
+    uint32_t tail = rendered_photo_tail_offset(assembled);
+    CHECK(memcmp(assembled + tail, k_test_file + 2, sizeof(k_test_file) - 2) == 0);
+}
+
+static void test_different_slots_and_captures_have_distinct_content(void)
+{
+    pentax_cam_model_t m;
+    pentax_cam_model_init(&m, k_test_file, sizeof(k_test_file));
+    connect(&m);
+
+    do_cmd1(&m, G_ACT, C_SHUTTER, 2); /* -> slot 0 */
+    do_cmd1(&m, G_ACT, C_SHUTTER, 2); /* -> slot 1 */
+    CHECK_EQ(m.buffer_mask, 0x3u);
+
+    /* same template, but the marker segment differs: not byte-identical */
+    CHECK(m.slot_file_size[0] == m.slot_file_size[1]); /* same payload width (single-digit slot, fixed-width seq) */
+    CHECK(memcmp(m.slot_files[0], m.slot_files[1], m.slot_file_size[0]) != 0);
+
+    /* and each one's marker actually names its own slot, not the other's */
+    CHECK(bytes_contain(m.slot_files[0], m.slot_file_size[0], "SLOT=0"));
+    CHECK(bytes_contain(m.slot_files[1], m.slot_file_size[1], "SLOT=1"));
+    CHECK(!bytes_contain(m.slot_files[0], m.slot_file_size[0], "SLOT=1"));
+    CHECK(!bytes_contain(m.slot_files[1], m.slot_file_size[1], "SLOT=0"));
+
+    /* delete slot 0 and capture again: the new photo lands in slot 0 again,
+     * but with a new sequence number, so it still isn't identical to what
+     * slot 0 held before. */
+    uint8_t old_slot0[PENTAX_CAM_MAX_PHOTO_SIZE];
+    uint32_t old_slot0_size = m.slot_file_size[0];
+    memcpy(old_slot0, m.slot_files[0], old_slot0_size);
+
+    do_cmd1(&m, G_BUF, C_BUF_DELETE, 0);
+    do_cmd1(&m, G_ACT, C_SHUTTER, 2); /* reuses the now-free slot 0 */
+    CHECK_EQ(m.buffer_mask, 0x3u);
+    CHECK_EQ(m.slot_file_size[0], old_slot0_size); /* same fixed-width marker */
+    CHECK(memcmp(m.slot_files[0], old_slot0, old_slot0_size) != 0); /* different sequence number */
 }
 
 static void test_download_prepare_rejects_bad_address_and_clamps_length(void)
@@ -533,15 +601,16 @@ static void test_download_prepare_rejects_bad_address_and_clamps_length(void)
     connect(&m);
     do_cmd1(&m, G_ACT, C_SHUTTER, 2);
     do_cmd3(&m, G_BUF, C_BUF_SELECT, 0, 0, 0);
+    uint32_t rendered_size = m.slot_file_size[0];
 
     /* address below the virtual file's base */
     do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base - 1, 4);
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_ILLEGAL_PARAM);
 
     /* requesting more than remains is silently clamped, not rejected */
-    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, sizeof(k_test_file) + 1000);
+    do_cmd2(&m, G_DL, C_DL_PREPARE, m.file_addr_base, rendered_size + 1000);
     CHECK_EQ(m.command_status, PENTAX_CAM_ST_OK);
-    CHECK_EQ(m.result_len, sizeof(k_test_file));
+    CHECK_EQ(m.result_len, rendered_size);
 
     /* DOWNLOAD_PREPARE without a selected buffer must fail */
     pentax_cam_model_t m2;
@@ -597,6 +666,7 @@ int main(void)
     RUN(test_bulb_start_stop_captures_photo);
     RUN(test_dust_removal);
     RUN(test_multi_slot_capture_select_delete);
+    RUN(test_different_slots_and_captures_have_distinct_content);
     RUN(test_segment_info_and_next);
     RUN(test_download_full_file_single_chunk);
     RUN(test_download_multi_chunk_like_real_dl_chunk_looping);

@@ -20,6 +20,12 @@ this is a companion to) without needing the real camera attached.
   connect, bulb start/stop, and the RAM-buffer download path (buffer
   select/status/delete, segment info/next, download prepare + streamed
   result bytes) across all 10 RAM buffer slots.
+- Each capture renders its own distinct copy of the template JPEG (a small
+  COM/comment marker segment identifying the slot and a monotonically
+  increasing capture sequence number is inserted right after SOI), so
+  different RAM slots -- and successive captures into the same slot --
+  download byte-for-byte different content instead of every slot serving
+  an identical file.
 - Parameter writes are validated against the same bounds the real
   PentaxHub firmware itself enforces, and reflected back into the 408-byte
   status buffer at the documented offsets, so a set-then-read-back round
@@ -32,10 +38,9 @@ authoritative source for every value there).
 
 ## What it deliberately doesn't do
 
-- **One virtual photo.** Every RAM buffer slot serves the same tiny
-  (2x2) but structurally valid JPEG. Good enough to exercise the
-  segment/download/READ_RESULT protocol end-to-end; not a source of
-  realistic photo content.
+- **Real photo content.** Every capture is still a tiny (2x2) JPEG
+  template, just with a distinguishing marker per slot/sequence number
+  (see above) -- not a source of realistic photo imagery.
 - **SD card access is a stub.** The real firmware also probes the
   camera's SD card over standard SCSI READ(10) -- itself flagged as
   unverified on real hardware in the PentaxHub project's own architecture

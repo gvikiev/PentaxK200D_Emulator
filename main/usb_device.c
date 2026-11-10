@@ -37,13 +37,16 @@ static uint64_t log_timestamp_ms(void)
 static pentax_cam_model_t s_cam;
 
 /* =========================================================
- * Virtual JPEG served for every RAM buffer slot.
+ * Template JPEG every capture is rendered from.
  *
  * This is a deliberately tiny (but structurally valid) 2x2 JPEG: enough to
  * exercise the download/segment/READ_RESULT protocol end-to-end without
- * needing a real K200D-sized photo. A real multi-MB file could be supplied
- * through another storage source later without changing the transport
- * code in pentax_cam_model.c or below.
+ * needing a real K200D-sized photo. pentax_cam_model.c's capture_new_photo()
+ * makes each RAM slot's own copy from this template (with a small marker
+ * segment identifying the slot/sequence number), so different captures
+ * genuinely differ byte-for-byte instead of every slot serving the same
+ * bytes. A real multi-MB file could be supplied through another storage
+ * source later without changing the transport code here.
  * ========================================================= */
 static const uint8_t s_test_jpeg[] = {
     0xFF, 0xD8,
@@ -551,8 +554,8 @@ esp_err_t usb_device_init(void)
     ESP_LOGI(TAG, "Pentax USB Device initialized");
     ESP_LOGI(TAG, "VID: 0x%04X, PID: 0x%04X", pentax_device_descriptor.idVendor, pentax_device_descriptor.idProduct);
     ESP_LOGI(TAG, "USB Interface: MSC / SCSI / BOT");
-    ESP_LOGI(TAG, "Virtual file: addr=0x%08lX size=%lu bytes",
-             (unsigned long)s_cam.file_addr_base, (unsigned long)s_cam.file_size);
+    ESP_LOGI(TAG, "Virtual file template: addr=0x%08lX size=%lu bytes (%u RAM slots, each capture gets its own copy)",
+             (unsigned long)s_cam.file_addr_base, (unsigned long)s_cam.template_size, PENTAX_CAM_RAM_SLOTS);
 
     return ESP_OK;
 }
